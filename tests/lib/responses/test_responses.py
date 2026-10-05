@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing_extensions import TypeVar
 
 import pytest
+from pydantic import BaseModel
 from inline_snapshot import snapshot
 
 from openai import OpenAI, AsyncOpenAI
@@ -10,7 +11,13 @@ from tests.respx2 import MockRouter
 from openai._types import omit
 from openai._utils import assert_signatures_in_sync
 from openai._models import construct_type_unchecked
-from openai.types.responses import Response, ResponseCreatedEvent, ResponseOutputItemAddedEvent
+from openai.types.responses import (
+    Response,
+    ResponseCreatedEvent,
+    ParsedResponseOutputText,
+    ParsedResponseOutputMessage,
+    ResponseOutputItemAddedEvent,
+)
 from openai.lib._parsing._responses import parse_response
 from openai.lib.streaming.responses._responses import ResponseStreamState
 
@@ -207,3 +214,60 @@ def test_stream_state_ignores_output_item_added_with_null_item() -> None:
 
     assert events == [added]
     assert state.accumulate_event(added).output == []
+
+
+def test_response_with_null_output_text_item() -> None:
+    """Regression test for https://github.com/openai/openai-python/issues/3063.
+
+    The API can return an `output_text` content item with `text: null`.
+    Strict parsing must accept it, `output_text` must ignore it, and
+    structured parsing must skip it instead of failing.
+    """
+
+    class Message(BaseModel):
+        message: str
+
+    response = Response.model_validate(
+        {
+            "id": "resp_null_output_text",
+            "object": "response",
+            "created_at": 0,
+            "status": "completed",
+            "model": "gpt-4o-mini",
+            "output": [
+                {
+                    "id": "msg_null_output_text",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "annotations": [], "logprobs": [], "text": None},
+                        {
+                            "type": "output_text",
+                            "annotations": [],
+                            "logprobs": [],
+                            "text": '{"message":"hello"}',
+                        },
+                    ],
+                }
+            ],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+        }
+    )
+
+    assert response.output_text == '{"message":"hello"}'
+
+    parsed = parse_response(text_format=Message, input_tools=omit, response=response)
+    message = parsed.output[0]
+    assert isinstance(message, ParsedResponseOutputMessage)
+
+    null_item, text_item = message.content
+    assert isinstance(null_item, ParsedResponseOutputText)
+    assert null_item.text is None
+    assert null_item.parsed is None
+
+    assert isinstance(text_item, ParsedResponseOutputText)
+    assert text_item.text == '{"message":"hello"}'
+    assert text_item.parsed == Message(message="hello")

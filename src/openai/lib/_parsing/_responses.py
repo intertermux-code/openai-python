@@ -73,7 +73,13 @@ def parse_response(
                         type_=cast("type[ParsedResponseOutputText[TextFormatT]]", ParsedResponseOutputText),
                         value={
                             **item.to_dict(),
-                            "parsed": parse_text(item.text, text_format=text_format, phase=output.phase),
+                            # A null text item carries no content to structure-parse;
+                            # keep the item with `parsed` unset instead of failing.
+                            "parsed": (
+                                parse_text(item.text, text_format=text_format, phase=output.phase)
+                                if item.text is not None
+                                else None
+                            ),
                         },
                     )
                 )
