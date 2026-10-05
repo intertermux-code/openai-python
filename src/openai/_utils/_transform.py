@@ -151,6 +151,86 @@ def _no_transform_needed(annotation: type) -> bool:
     return annotation == float or annotation == int
 
 
+@lru_cache(maxsize=8096)
+def _type_may_need_transform(type_: object) -> bool:
+    """Whether transforming data against this type could change it.
+
+    Decided once per type and cached. The transform only rewrites data from
+    `PropertyInfo` alias/format metadata (`discriminator` is only used when
+    parsing responses, never when transforming requests), so types without
+    any such metadata can skip the per-node typing introspection entirely.
+    """
+    return _type_may_need_transform_inner(type_, frozenset())
+
+
+def _type_may_need_transform_inner(type_: object, seen: frozenset[object]) -> bool:
+    if type_ in seen:
+        # Recursive type; anything reachable through the cycle was already
+        # visited above it.
+        return False
+    seen = seen | {type_}
+
+    if is_required_type(type_) or is_not_required_type(type_):
+        return _type_may_need_transform_inner(get_args(type_)[0], seen)
+
+    if is_annotated_type(type_):
+        args = get_args(type_)
+        for metadata in args[1:]:
+            if isinstance(metadata, PropertyInfo) and (metadata.alias is not None or metadata.format is not None):
+                return True
+        return _type_may_need_transform_inner(args[0], seen)
+
+    if is_typeddict(type_):
+        return any(
+            _type_may_need_transform_inner(hint, seen)
+            for hint in get_type_hints(type_, include_extras=True).values()
+        )
+
+    if isinstance(type_, type) and issubclass(type_, pydantic.BaseModel):
+        # model_dump() always runs for models, even without metadata
+        return True
+
+    if is_union_type(type_) or get_origin(type_) is not None:
+        return any(_type_may_need_transform_inner(arg, seen) for arg in get_args(type_))
+
+    return False
+
+
+@lru_cache(maxsize=8096)
+def _list_items_need_no_transform(type_: object) -> bool:
+    """Mirror of the `_no_transform_needed` fast path for list data."""
+    stripped = strip_annotated_type(type_)
+    if is_list_type(stripped) or is_iterable_type(stripped) or is_sequence_type(stripped):
+        args = get_args(stripped)
+        return _no_transform_needed(args[0]) if args else False
+    return False
+
+
+def _shallow_transform(data: object) -> object:
+    """Data-driven transform for types without `PropertyInfo` metadata.
+
+    This is what `_transform_recursive` reduces to when no alias/format
+    metadata is present: dump pydantic models, strip `NOT_GIVEN`/`omit`
+    sentinels and make iterables JSON-serializable. It performs no typing
+    introspection, so it stays cheap no matter how large the data is.
+    """
+    from .._compat import model_dump
+
+    if isinstance(data, pydantic.BaseModel):
+        return model_dump(data, exclude_unset=True, mode="json", exclude=getattr(data, "__api_exclude__", None))
+
+    if is_mapping(data):
+        return {key: _shallow_transform(value) for key, value in data.items() if is_given(value)}
+
+    if is_list(data):
+        return [_shallow_transform(value) for value in data]
+
+    if is_iterable(data) and not isinstance(data, (str, bytes)):
+        return [_shallow_transform(value) for value in data]
+
+    return data
+
+
 def _transform_recursive(
     data: object,
     *,
@@ -173,6 +253,14 @@ def _transform_recursive(
 
     if inner_type is None:
         inner_type = annotation
+
+    if not _type_may_need_transform(annotation):
+        # Fast path: no alias/format metadata exists anywhere under this type
+        # (inner_type is always annotation or a part of it), so the typing
+        # introspection (and union fan-out) below is pure overhead.
+        if is_list(data) and _list_items_need_no_transform(inner_type):
+            return data
+        return _shallow_transform(data)
 
     stripped_type = strip_annotated_type(inner_type)
     origin = get_origin(stripped_type) or stripped_type
@@ -341,6 +429,15 @@ async def _async_transform_recursive(
 
     if inner_type is None:
         inner_type = annotation
+
+    if not _type_may_need_transform(annotation):
+        # Fast path: no alias/format metadata exists anywhere under this type
+        # (inner_type is always annotation or a part of it), so the typing
+        # introspection (and union fan-out) below is pure overhead.
+        # Note: _shallow_transform is sync; there is nothing to await here.
+        if is_list(data) and _list_items_need_no_transform(inner_type):
+            return data
+        return _shallow_transform(data)
 
     stripped_type = strip_annotated_type(inner_type)
     origin = get_origin(stripped_type) or stripped_type

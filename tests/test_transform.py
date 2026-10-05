@@ -15,6 +15,7 @@ from openai._utils import (
     parse_datetime,
     async_transform as _async_transform,
 )
+from openai._utils._transform import _type_may_need_transform
 from openai._compat import PYDANTIC_V1
 from openai._models import BaseModel
 
@@ -525,4 +526,43 @@ async def test_not_required_transforms(use_async: bool) -> None:
     }
     assert await transform({"items": [{"this_thing": 1}]}, DateDictWithNotRequiredAlias, use_async) == {
         "items": [{"this__thing": 1}]
+    }
+
+
+class PlainParams(TypedDict, total=False):
+    model: str
+    input: List[Dict[str, object]]
+    metadata: Dict[str, object]
+
+
+class DiscriminatedOnly(TypedDict):
+    tool: Annotated[Union[Dict[str, object], List[object]], PropertyInfo(discriminator="type")]
+
+
+@parametrize
+@pytest.mark.asyncio
+async def test_no_metadata_fast_path(use_async: bool) -> None:
+    # Types without PropertyInfo alias/format metadata skip the per-node
+    # typing walk. Discriminators don't count: they are only used when
+    # parsing responses, never when transforming requests.
+    assert not _type_may_need_transform(PlainParams)
+    assert not _type_may_need_transform(DiscriminatedOnly)
+    assert _type_may_need_transform(Foo1)
+    assert _type_may_need_transform(DatetimeDict)
+
+    data = {
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": "hi"}],
+        "metadata": {"model": MyModel.construct(foo="hi!")},
+        "tags": ("a", "b"),
+        "unset": not_given,
+    }
+    assert await transform(data, PlainParams, use_async) == {
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": "hi"}],
+        # nested pydantic models are still dumped on the fast path
+        "metadata": {"model": {"foo": "hi!"}},
+        # iterables are still made JSON-serializable
+        "tags": ["a", "b"],
+        # NOT_GIVEN values are still stripped
     }
